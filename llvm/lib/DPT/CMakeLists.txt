@@ -1,6 +1,5 @@
 add_llvm_library(DPT
   DataPtrTagPass.cpp
-  ASanPass.cpp
 	DPT.cpp
 
   ADDITIONAL_HEADER_DIRS
