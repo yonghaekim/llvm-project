@@ -48,6 +48,9 @@ def InstFormatCA     : InstFormat<14>;
 def InstFormatCB     : InstFormat<15>;
 def InstFormatCJ     : InstFormat<16>;
 def InstFormatOther  : InstFormat<17>;
+//yh+begin
+def InstFormatW      : InstFormat<18>;
+//yh+end
 
 class RISCVVConstraint<bits<3> val> {
   bits<3> Value = val;
@@ -577,3 +580,119 @@ class DirectiveInsnJ<dag outs, dag ins, string argstr>
 
   let AsmString = ".insn j " # argstr;
 }
+
+//yh+begin
+class DestSrcTwo<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs2;
+  bits<5> rs1;
+  bits<5> rd;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = rs2;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = rd;
+  let Opcode = opcode;
+}
+
+class DestSrcOne<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs1;
+  bits<5> rd;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = 0b00000;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = rd;
+  let Opcode = opcode;
+}
+
+class SrcTwo<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs2;
+  bits<5> rs1;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = rs2;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = 0b00000;
+  let Opcode = opcode;
+}
+
+class RVInstW<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs2;
+  bits<5> rs1;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = rs2;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = 0b00000;
+  let Opcode = opcode;
+}
+
+
+class AcfiDestSrcTwo<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs2;
+  bits<5> rs1;
+  bits<5> rd;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = rs2;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = rd;
+  let Opcode = opcode;
+}
+
+class AcfiDestSrcOne<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs1;
+  bits<5> rd;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = 0b00000;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = rd;
+  let Opcode = opcode;
+}
+
+class AcfiSrcTwo<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs2;
+  bits<5> rs1;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = rs2;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = 0b00000;
+  let Opcode = opcode;
+}
+
+class AcfiSrcOne<bits<3> funct3, bits<7> opcode, dag outs, dag ins,
+              string opcodestr, string argstr>
+    : RVInst<outs, ins, opcodestr, argstr, [], InstFormatW> {
+  bits<5> rs1;
+
+  let Inst{31-25} = 0b0000000;
+  let Inst{24-20} = 0b00000;
+  let Inst{19-15} = rs1;
+  let Inst{14-12} = funct3;
+  let Inst{11-7} = 0b00000;
+  let Opcode = opcode;
+}
+//yh+end

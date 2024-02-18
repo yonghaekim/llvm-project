@@ -46,6 +46,13 @@ add_llvm_target(RISCVCodeGen
   GISel/RISCVInstructionSelector.cpp
   GISel/RISCVLegalizerInfo.cpp
   GISel/RISCVRegisterBankInfo.cpp
+  #yh+begin
+  ACFI/RISCVAcfiPass.cpp
+	DPT/RISCVDptPass.cpp
+	LINK_LIBS
+  ACFI
+  DPT
+	#yh+end
 
   LINK_COMPONENTS
   Analysis

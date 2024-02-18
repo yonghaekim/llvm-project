@@ -1598,3 +1598,5 @@ def int_riscv_sm3p1      : ScalarCryptoGprIntrinsicAny;
 // Vendor extensions
 //===----------------------------------------------------------------------===//
 include "llvm/IR/IntrinsicsRISCVXTHead.td"
+include "llvm/ACFI/Intrinsics.td" //yh+
+include "llvm/DPT/Intrinsics.td" //yh+

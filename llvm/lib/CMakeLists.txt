@@ -47,6 +47,11 @@ endif()
 add_subdirectory(WindowsDriver)
 add_subdirectory(WindowsManifest)
 
+add_subdirectory(ACFI) #yh+
+add_subdirectory(DPT) #yh+
+add_subdirectory(SHA3) #yh+
+add_subdirectory(PARTS-sha3) #yh+
+
 set(LLVMCONFIGLIBRARYDEPENDENCIESINC "${LLVM_BINARY_DIR}/tools/llvm-config/LibraryDependencies.inc")
 
 # Special components which don't have any source attached but aggregate other

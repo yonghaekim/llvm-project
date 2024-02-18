@@ -35,6 +35,8 @@
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/ACFI/ACFI.h" //yh+
+#include "llvm/DPT/DPT.h" //yh+
 #include <optional>
 using namespace llvm;
 
@@ -278,6 +280,25 @@ void RISCVPassConfig::addIRPasses() {
     addPass(createRISCVCodeGenPreparePass());
 
   TargetPassConfig::addIRPasses();
+
+	//yh+begin
+  const auto dptInstType = DPT::getDptInstType();
+	if (dptInstType != DPT::None) {
+		addPass(DPT::createDataPtrTagPass());
+		addPass(DPT::createASanPass());
+	}
+
+  const auto acfiInstType = ACFI::getAcfiInstType();
+	if (acfiInstType != ACFI::None) {
+		//addPass(ACFI::createJumpTableGenPass());
+		//addPass(ACFI::createFuncAddrSignPass());
+		//addPass(ACFI::createShadowCallMemPass());
+		addPass(ACFI::createIFCCPass());
+		addPass(ACFI::createPAPass());
+		addPass(ACFI::createACFIPass());
+		addPass(ACFI::createMCPass());
+	}
+	//yh+end
 }
 
 bool RISCVPassConfig::addPreISel() {
@@ -328,6 +349,10 @@ void RISCVPassConfig::addPreSched2() {}
 void RISCVPassConfig::addPreEmitPass() {
   addPass(&BranchRelaxationPassID);
   addPass(createRISCVMakeCompressibleOptPass());
+	//yh+begin
+  addPass(createRISCVDptPass());
+	addPass(createRISCVAcfiPass());
+	//yh+end
 }
 
 void RISCVPassConfig::addPreEmitPass2() {

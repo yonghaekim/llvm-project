@@ -1,0 +1,300 @@
+#include "llvm/ACFI/JumpTableGenPass.h"
+#include "llvm/ACFI/ACFI.h"
+#include "llvm/IR/InlineAsm.h"
+
+#define ASSERT(x) if (!(x)) *(voidptr) = 0;
+
+char JumpTableGenPass::ID = 0;
+static RegisterPass<JumpTableGenPass> X("acfi-jt", "Function address sign pass");
+
+Pass *llvm::ACFI::createJumpTableGenPass() { return new JumpTableGenPass(); }
+
+bool JumpTableGenPass::runOnModule(Module &M) {
+	errs() << "Start Jump Table Gen pass!\n";
+
+	init(M);
+  auto const acfiInstType = llvm::ACFI::getAcfiInstType();
+  auto const acfiQemuMode = llvm::ACFI::getAcfiQemuMode();
+
+  if (acfiInstType == AcfiType::None)
+	  return false;
+
+  IFCC = (acfiInstType == AcfiType::IFCC);
+  PA = (acfiInstType == AcfiType::PA);
+  ACFI = (acfiInstType == AcfiType::ACFI);
+	QEMU = (acfiQemuMode == AcfiQemuEn::Enable);
+  LARGE_ALIGN = true;
+
+	handleBitCastInsts(M);
+  initBlackSet();
+	findWhiteSet(M);
+	makeJumpTables(M);
+
+	return false; // function_modified = false
+}
+
+set<Function*> JumpTableGenPass::getWhiteSet() {
+  return white_set;
+}
+
+map<unsigned, list<Function*>*> JumpTableGenPass::getFuncListMap() {
+  return fl_map;
+}
+
+map<unsigned, Function*> JumpTableGenPass::getJumpTableMap() {
+  return jt_map;
+}
+
+void JumpTableGenPass::initBlackSet() {
+	black_set.insert("llvm.va_start");
+	black_set.insert("llvm.va_end");
+	black_set.insert("llvm.lifetime.start.p0i8");
+	black_set.insert("llvm.lifetime.end.p0i8");
+	black_set.insert("llvm.dbg.declare");
+	black_set.insert("llvm.dbg.label");
+	black_set.insert("llvm.prefetch");
+	black_set.insert("llvm.stacksave");
+	black_set.insert("llvm.stackrestore");
+	black_set.insert("llvm.floor.f64");
+	black_set.insert("llvm.floor.f32");
+	black_set.insert("llvm.ceil.f64");
+	black_set.insert("llvm.ceil.f32");
+	black_set.insert("llvm.fabs.f64");
+	black_set.insert("llvm.fabs.f32");
+	black_set.insert("llvm.va_copy");
+	black_set.insert("llvm.round.f64");
+	black_set.insert("llvm.trap");
+}
+
+void JumpTableGenPass::findWhiteSet(Module &M) {
+	for (auto &F: M) {
+    // Skip blacklisted functions
+		bool match = false;
+		for (auto x: black_set) {
+			if (F.getName() == x) {
+				match = true;
+				break;
+			}
+		}
+
+		if (match)
+			continue;
+
+    // No need to include startup code
+		if (F.getSection().find(".text.startup") != std::string::npos)
+      continue;
+
+		for (auto pU: F.users()) {
+			if (auto pSI = dyn_cast<StoreInst>(pU)) {
+				if (pSI->getValueOperand() == &F)
+					white_set.insert(&F);
+			} else if (auto pCI = dyn_cast<CallInst>(pU)) {
+				if (pCI->getCalledFunction() != &F)
+					white_set.insert(&F);
+			} else if (auto pII = dyn_cast<InvokeInst>(pU)) {
+				if (pII->getCalledFunction() != &F)
+					white_set.insert(&F);
+			} else if (dyn_cast<SelectInst>(pU)) {
+				white_set.insert(&F);
+			} else if (dyn_cast<PHINode>(pU)) {
+				white_set.insert(&F);
+			} else if (dyn_cast<GlobalVariable>(pU)) {
+				white_set.insert(&F);
+			} else if (dyn_cast<BitCastOperator>(pU)) {
+				white_set.insert(&F);
+			} else if (dyn_cast<Constant>(pU)) {
+				white_set.insert(&F);
+			}
+		}
+	}
+
+	errs() << "Size of white set: " << white_set.size() << "\n";
+	for (auto pF: white_set) {
+		errs() << "--" << pF->getName() << "\n";
+	}
+}
+
+void JumpTableGenPass::makeJumpTables(Module &M) {
+	for (auto pF: white_set) {
+		if (pF->isVarArg()) {
+			errs() << "Found VarArg! " << pF->getName() << "\n";
+		}
+		unsigned num_param = pF->getFunctionType()->getNumParams();
+
+		if (!fl_map[num_param])
+			fl_map[num_param] = new list<Function*>;
+
+		fl_map[num_param]->push_back(pF);
+
+		if (!jt_map[num_param]) {
+			FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), false);
+			Function *jt = Function::Create(FuncTypeA, Function::ExternalLinkage, "__cfi_jumptable", M);
+			auto pBB = BasicBlock::Create(*C, "", jt, nullptr);
+			new UnreachableInst(*C, pBB);
+			jt->setAlignment(Align(8));
+			jt_map[num_param] = jt;
+		}
+	}
+
+  if (LARGE_ALIGN) {
+    // Set alignment
+    for (auto x: fl_map) {
+      unsigned num_param = x.first;
+
+      if (auto func_list = x.second) {
+        unsigned num_entry = func_list->size();
+        unsigned pow2cnt = getNextPow2(16*num_entry);
+
+        jt_map[num_param]->setAlignment(Align(pow2cnt));
+        errs() << "Set alignment: " << pow2cnt << "\n";
+      }
+    }
+  }
+
+	for (auto x: jt_map) {
+		unsigned num_param = x.first;
+
+		if (Function *jt = x.second) {
+      unsigned cnt = 0;
+      auto &BB = jt->back();
+      auto &I = BB.back();
+      IRBuilder<> Builder(&I);
+
+			errs() << "# params(" << num_param << ") " << jt->getName() << "\n";
+
+			for (auto pF: *fl_map[num_param]) {
+				FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), {Type::getInt8PtrTy(*C)}, false);
+				FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {}, false);
+
+				auto castA = Builder.CreateCast(Instruction::BitCast, pF, Type::getInt8PtrTy(*C));
+
+			  //InlineAsm *sdA = InlineAsm::get(FuncTypeB, "mv t2, a0\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(sdA, {});
+
+			  //InlineAsm *lla = InlineAsm::get(FuncTypeA, "mv t1, $0\0A", "r", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(lla, {castA});
+
+			  //InlineAsm *move = InlineAsm::get(FuncTypeB, "mv a0, t2\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(move, {});
+
+			  InlineAsm *jalr = InlineAsm::get(FuncTypeA, "jalr $0, 0($0)\0A", "r", /*hasSideEffects=*/ true);
+			  Builder.CreateCall(jalr, {castA});
+
+			  //InlineAsm *sd = InlineAsm::get(FuncTypeA, "sd $0,-16(sp)\0A", "X", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(sd, {castA});
+
+			  //InlineAsm *ld = InlineAsm::get(FuncTypeB, "ld t1,-16(sp)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(ld, {});
+
+			  //InlineAsm *ldB = InlineAsm::get(FuncTypeB, "mv a0, t2\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(ldB, {});
+
+			  //InlineAsm *jump = InlineAsm::get(FuncTypeB, "jalr t1, 0(t1)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(jump, {});
+
+			  InlineAsm *trap = InlineAsm::get(FuncTypeB, "ebreak", "", /*hasSideEffects=*/ true);
+        Builder.CreateCall(trap);
+        Builder.CreateCall(trap);
+        //Builder.CreateCall(trap);
+        //Builder.CreateCall(trap);
+        cnt++;
+
+
+			  //InlineAsm *sdA = InlineAsm::get(FuncTypeB, "sd a0,-8(sp)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(sdA, {});
+
+			  //InlineAsm *sd = InlineAsm::get(FuncTypeA, "sd $0,-16(sp)\0A", "X", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(sd, {castA});
+
+			  //InlineAsm *ld = InlineAsm::get(FuncTypeB, "ld t1,-16(sp)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(ld, {});
+
+			  //InlineAsm *ldB = InlineAsm::get(FuncTypeB, "ld a0,-8(sp)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(ldB, {});
+
+			  //InlineAsm *jump = InlineAsm::get(FuncTypeB, "jalr t1, 0(t1)\0A", "", /*hasSideEffects=*/ true);
+			  //Builder.CreateCall(jump, {});
+
+			  //InlineAsm *trap = InlineAsm::get(FuncTypeB, "ebreak", "", /*hasSideEffects=*/ true);
+        //Builder.CreateCall(trap);
+        //Builder.CreateCall(trap);
+        //cnt++;
+
+				errs() << "  -- " << pF->getName() << "\n";
+			}
+
+      unsigned pow2cnt = getNextPow2(16*cnt);
+			unsigned num_pad = (pow2cnt - 16*cnt) / 2;
+      //errs() << "cnt: " << cnt << " pow2cnt: " << pow2cnt << " num_pad: " << num_pad << "\n";
+      for (unsigned i=0; i<num_pad; i++) {
+				//FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {Type::getInt16Ty(*C)}, false);
+			  //InlineAsm *trap = InlineAsm::get(FuncTypeB, "ebreak $0\0A", "i", /*hasSideEffects=*/ true);
+        //Builder.CreateCall(trap, {ConstantInt::get(Type::getInt16Ty(*C), 1)});
+        //Builder.CreateCall(trap, {ConstantInt::get(Type::getInt16Ty(*C), 1)});
+				FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {}, false);
+			  InlineAsm *trap = InlineAsm::get(FuncTypeB, "ebreak", "", /*hasSideEffects=*/ true);
+        Builder.CreateCall(trap);
+      }
+		}
+	}
+}
+
+void JumpTableGenPass::handleBitCastInsts(Module &M) {
+  map<BitCastInst*, unsigned> bitcast_map;
+
+	for (auto &F: M) {
+		for (auto &BB: F) {
+			for (auto &I: BB) {
+				if (auto pBC = dyn_cast<BitCastInst>(&I)) {
+					if (pBC->getSrcTy()->isPointerTy()) {
+						auto src_pty = dyn_cast<PointerType>(pBC->getSrcTy());
+						auto dst_pty = dyn_cast<PointerType>(pBC->getDestTy());
+
+						if (!src_pty->getElementType()->isFunctionTy() &&
+								dst_pty->getElementType()->isFunctionTy()) {
+              auto fty = dyn_cast<FunctionType>(dst_pty->getElementType());
+              unsigned num_param = fty->getNumParams();
+              bitcast_map[pBC] = num_param;
+							errs() << "(1) !Func -> Fun: "; pBC->dump();
+						}
+
+						if (src_pty->getElementType()->isFunctionTy() &&
+								!dst_pty->getElementType()->isFunctionTy()) {
+							errs() << "(2) Func -> !Fun: "; pBC->dump();
+            }
+					}
+				}
+			}
+		}
+	}
+
+  for (auto x: bitcast_map) {
+    auto pBC = x.first;
+    auto num_param = x.second;
+  	auto context = ConstantInt::get(Type::getInt64Ty(*C), num_param);
+
+    IRBuilder<> Builder(pBC->getNextNode());
+    if (PA || ACFI) {
+      FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C)}, false);
+      auto tagi = QEMU? M.getOrInsertFunction("__tagi", FuncTypeA) :
+                        Intrinsic::getDeclaration(&M, Intrinsic::acfi_tagi, {Type::getInt8PtrTy(*C)});
+
+      auto castA = dyn_cast<Instruction>(Builder.CreateCast(Instruction::BitCast, pBC, Type::getInt8PtrTy(*C)));
+      auto callA = Builder.CreateCall(tagi, {castA, context}, "");
+      auto castB = Builder.CreateCast(Instruction::BitCast, callA, pBC->getType());
+
+      pBC->replaceAllUsesWith(castB);
+      castA->setOperand(0, pBC);
+    }
+  }
+}
+
+void JumpTableGenPass::init(Module &M) {
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+		  C = &F.getContext();
+			DL = &F.getParent()->getDataLayout();
+			break;
+		}
+	}
+}

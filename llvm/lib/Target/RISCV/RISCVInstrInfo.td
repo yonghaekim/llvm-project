@@ -1843,6 +1843,88 @@ def : Pat<(binop_allwusers<add> GPR:$rs1, (AddiPair:$rs2)),
                  (AddiPairImmSmall AddiPair:$rs2))>;
 }
 
+//yh+begin
+let hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
+	// PA primitives
+  def TAGC : DestSrcTwo<0b000, 0b0001011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "tagc", "\t$rd, $rs1, $rs2">;
+  def TAGD : DestSrcTwo<0b001, 0b0001011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "tagd", "\t$rd, $rs1, $rs2">;
+  def AUTC : DestSrcTwo<0b010, 0b0001011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "autc", "\t$rd, $rs1, $rs2">;
+  def AUTD : DestSrcTwo<0b011, 0b0001011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "autd", "\t$rd, $rs1, $rs2">;
+  def XTAG : DestSrcOne<0b100, 0b0001011, (outs GPR:$rd), (ins GPR:$rs1), "xtag", "\t$rd, $rs1">;
+
+	// DPT primitives
+  def CSTR : SrcTwo<0b011, 0b0101011, (outs), (ins GPR:$rs1, GPR:$rs2), "cstr", "\t$rs1, $rs2">;
+  def CCLR : SrcTwo<0b111, 0b0101011, (outs), (ins GPR:$rs1, GPR:$rs2), "cclr", "\t$rs1, $rs2">;
+
+	// ACFI primitives
+  def ESTR : SrcTwo<0b000, 0b1011011, (outs), (ins GPR:$rs1, GPR:$rs2), "estr", "\t$rs1, $rs2">;
+  def ECLR : SrcTwo<0b001, 0b1011011, (outs), (ins GPR:$rs1, GPR:$rs2), "eclr", "\t$rs1, $rs2">;
+  def EACT : SrcTwo<0b010, 0b1011011, (outs), (ins GPR:$rs1, GPR:$rs2), "eact", "\t$rs1, $rs2">;
+  def EDEA : SrcTwo<0b011, 0b1011011, (outs), (ins GPR:$rs1, GPR:$rs2), "edea", "\t$rs1, $rs2">;
+  def ECHK : SrcTwo<0b100, 0b1011011, (outs), (ins GPR:$rs1, GPR:$rs2), "echk", "\t$rs1, $rs2">;
+
+	// Bit manipulation primitives
+  def BSETM : DestSrcTwo<0b000, 0b1111011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "bsetm", "\t$rs1">;
+  def BCLRM : DestSrcTwo<0b001, 0b1111011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "bclrm", "\t$rs1">;
+  def BEXTM : DestSrcTwo<0b010, 0b1111011, (outs GPR:$rd), (ins GPR:$rs1, GPR:$rs2), "bextm", "\t$rd, $rs1">;
+}
+
+let isPseudo = 1, hasNoSchedulingInfo = 1 in {
+	// PA primitives
+  def PA_TAGD : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(set i64:$rd, (int_pa_tagd GPR:$rs1, GPR:$rs2))]>;
+  def PA_TAGC : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(set i64:$rd, (int_pa_tagc GPR:$rs1, GPR:$rs2))]>;
+  def PA_AUTC : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(set i64:$rd, (int_pa_autc GPR:$rs1, GPR:$rs2))]>;
+  def PA_AUTD : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(set i64:$rd, (int_pa_autd GPR:$rs1, GPR:$rs2))]>;
+  def PA_XTAG : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1),
+                          [(set i64:$rd, (int_pa_xtag GPR:$rs1))]>;
+
+	// DPT primitives
+  def DPT_CSTR : Pseudo<(outs),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(int_dpt_cstr GPR: $rs1, GPR:$rs2)]>;
+  def DPT_CCLR : Pseudo<(outs),
+                          (ins GPR:$rs1),
+                          [(int_dpt_cclr GPR: $rs1)]>;
+
+	// ACFI primitives
+  def ACFI_ESTR : Pseudo<(outs),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(int_acfi_estr GPR: $rs1, GPR:$rs2)]>;
+  def ACFI_ECLR : Pseudo<(outs),
+                          (ins GPR:$rs1),
+                          [(int_acfi_eclr GPR: $rs1)]>;
+  def ACFI_ECHK : Pseudo<(outs),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(int_acfi_echk GPR: $rs1, GPR:$rs2)]>;
+  def ACFI_EACT : Pseudo<(outs),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(int_acfi_eact GPR: $rs1, GPR:$rs2)]>;
+  def ACFI_EDEA : Pseudo<(outs),
+                          (ins GPR:$rs1, GPR:$rs2),
+                          [(int_acfi_edea GPR: $rs1, GPR:$rs2)]>;
+
+	// BM primitives
+  def BM_BSETM : Pseudo<(outs),
+                          (ins GPR:$rs1),
+                          [(int_bm_bsetm GPR: $rs1)]>;
+  def BM_BCLRM : Pseudo<(outs),
+                          (ins GPR:$rs1),
+                          [(int_bm_bclrm GPR: $rs1)]>;
+  def BM_BEXTM : Pseudo<(outs GPR:$rd),
+                          (ins GPR:$rs1),
+                          [(set i64:$rd, (int_bm_bextm GPR: $rs1))]>;
+}
+//yh+end
+
 //===----------------------------------------------------------------------===//
 // Standard extensions
 //===----------------------------------------------------------------------===//

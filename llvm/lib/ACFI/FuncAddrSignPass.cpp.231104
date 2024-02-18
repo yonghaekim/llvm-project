@@ -1,0 +1,1201 @@
+#include "llvm/ACFI/FuncAddrSignPass.h"
+#include "llvm/ACFI/ACFI.h"
+#include "llvm/IR/InlineAsm.h"
+
+#define PARTS_USE_SHA3
+
+extern "C" {
+#include "../SHA3/include/sha3.h"
+}
+
+#define ASSERT(x) if (!(x)) *(voidptr) = 0;
+
+char FuncAddrSignPass::ID = 0;
+static RegisterPass<FuncAddrSignPass> X("acfi-sign", "Function address sign pass");
+
+Pass *llvm::ACFI::createFuncAddrSignPass() { return new FuncAddrSignPass(); }
+
+bool FuncAddrSignPass::runOnModule(Module &M) {
+	errs() << "Start Function Address Sign pass!\n";
+
+	init(M);
+
+  auto const acfiInstType = llvm::ACFI::getAcfiInstType();
+  auto const acfiQemuMode = llvm::ACFI::getAcfiQemuMode();
+
+  if (acfiInstType == AcfiType::None) {
+		insertAcfiSet(M, 0);
+	  return false;
+	}
+
+  IFCC = (acfiInstType == AcfiType::IFCC);
+  PA = (acfiInstType == AcfiType::PA);
+  ACFI = (acfiInstType == AcfiType::ACFI);
+	QEMU = (acfiQemuMode == AcfiQemuEn::Enable);
+  LARGE_ALIGN = true;
+
+	JumpTableGenPass &MT = getAnalysis<JumpTableGenPass>();
+	white_set = MT.getWhiteSet();
+	fl_map = MT.getFuncListMap();
+	jt_map = MT.getJumpTableMap();
+
+	replaceUsers(M);
+	handleIndirectCalls(M);
+	handleGlobalVariables(M);
+
+	if (PA || ACFI)
+		handleIntrinsicFunctions(M);
+
+	insertAcfiSet(M, ACFI);
+	if (QEMU)
+	  printFuncAddr(M);
+
+	//errs() << "statMaxEqClassSize: " << statMaxEqClassSize << "\n";
+	//errs() << "statNumIndirectCall: " << statNumIndirectCall << "\n";
+	//errs() << "statNumESTR: " << statNumESTR << "\n";
+
+	return false; // function_modified = false
+}
+
+void FuncAddrSignPass::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.setPreservesAll();
+  AU.addRequired<JumpTableGenPass> ();
+}
+
+void FuncAddrSignPass::replaceUsers(Module &M) {
+	map<Function*,set<Instruction*>*> replace_map;
+	map<Function*,set<BitCastOperator*>*> bitcast_map;
+	map<Function*,set<PtrToIntOperator*>*> ptrtoint_map;
+	map<Function*,set<PHINode*>*> phinode_map;
+  map<Value*,Value*> jte_map;
+  map<Value*,Value*> context_map;
+
+	for (auto x: jt_map) {
+		unsigned num_param = x.first;
+		Function *jt = x.second;
+
+		if (!jt)
+			continue;
+
+		unsigned offset = 0;
+	  auto context = ConstantInt::get(Type::getInt64Ty(*C), num_param);
+
+		for (auto pF: *fl_map[num_param]) {
+      if (!replace_map[pF])
+        replace_map[pF] = new set<Instruction*>;
+      if (!bitcast_map[pF])
+        bitcast_map[pF] = new set<BitCastOperator*>;
+      if (!ptrtoint_map[pF])
+        ptrtoint_map[pF] = new set<PtrToIntOperator*>;
+      if (!phinode_map[pF])
+        phinode_map[pF] = new set<PHINode*>;
+
+			Value *jte = nullptr;
+			if (IFCC || ACFI) {
+				// CreateGEP
+				auto castA = ConstantExpr::getPtrToInt(jt, Type::getInt64Ty(*C));
+				auto offsetA = ConstantInt::get(Type::getInt64Ty(*C), offset*16);
+				auto addA = ConstantExpr::getAdd(castA, offsetA);
+				jte = ConstantExpr::getIntToPtr(addA, Type::getInt8PtrTy(*C));
+				offset++;
+			} else {
+				jte = dyn_cast<Value>(pF);
+			}
+
+			for (auto pU: pF->users()) {
+				if (auto pI = dyn_cast<Instruction>(pU)) {
+					if (auto pSI = dyn_cast<StoreInst>(pI)) {
+						if (pSI->getValueOperand() == pF) {
+							//replaceUser(M, pI, pF, jte, context);
+						  replace_map[pF]->insert(pI);
+              jte_map[pI] = jte;
+              context_map[pI] = context;
+            }
+					} else if (auto pCI = dyn_cast<CallInst>(pI)) {
+						if (pCI->getCalledFunction() != pF) {
+							//replaceUser(M, pI, pF, jte, context);
+  						replace_map[pF]->insert(pI);
+              jte_map[pI] = jte;
+              context_map[pI] = context;
+            }
+					} else if (auto pII = dyn_cast<InvokeInst>(pI)) {
+						if (pII->getCalledFunction() != pF) {
+							//replaceUser(M, pI, pF, jte, context);
+  						replace_map[pF]->insert(pI);
+              jte_map[pI] = jte;
+              context_map[pI] = context;
+            }
+					} else if (auto pBC = dyn_cast<BitCastInst>(pI)) {
+						ASSERT(false); // 
+					} else if (auto pSI = dyn_cast<SelectInst>(pI)) {
+						//replaceUser(M, pI, pF, jte, context);
+  					replace_map[pF]->insert(pI);
+            jte_map[pI] = jte;
+            context_map[pI] = context;
+					} else if (auto pCI = dyn_cast<ICmpInst>(pU)) {
+						// Do nothing
+					} else if (auto pPN = dyn_cast<PHINode>(pI)) {
+						//handlePHINode(M, pPN, pF, jte, context);
+  					phinode_map[pF]->insert(pPN);
+            jte_map[pI] = jte;
+            context_map[pI] = context;
+					} else {
+						errs() << "else pI->dump(): "; pI->dump(); //TODO
+					}
+				} else if (auto pGV = dyn_cast<GlobalVariable>(pU)) {
+					// will be handled separately
+				} else if (auto pPTI = dyn_cast<PtrToIntOperator>(pU)) {
+					//handlePtrToIntOperator(M, pPTI, jte, context);
+  				ptrtoint_map[pF]->insert(pPTI);
+          jte_map[pPTI] = jte;
+          context_map[pPTI] = context;
+				} else if (auto pBC = dyn_cast<BitCastOperator>(pU)) {
+					//handleBitCastOperator(M, pBC, jte, context);
+  				bitcast_map[pF]->insert(pBC);
+          jte_map[pBC] = jte;
+          context_map[pBC] = context;
+				} else if (auto pConst = dyn_cast<Constant>(pU)) {
+				} else {
+					errs() << "pU->dump(): "; pU->dump();
+				}
+			}
+		}
+	}
+
+	for (auto x: bitcast_map) {
+		Function *pF = x.first;
+		for (auto pBC: *(x.second)) {
+      auto jte = jte_map[pBC];
+      auto context = context_map[pBC];
+			handleBitCastOperator(M, pBC, jte, context);
+		}
+	}
+
+	for (auto x: ptrtoint_map) {
+		Function *pF = x.first;
+		for (auto pPTI: *(x.second)) {
+      auto jte = jte_map[pPTI];
+      auto context = context_map[pPTI];
+			handlePtrToIntOperator(M, pPTI, jte, context);
+		}
+	}
+
+	for (auto x: phinode_map) {
+		Function *pF = x.first;
+		for (auto pPN: *(x.second)) {
+      auto jte = jte_map[pPN];
+      auto context = context_map[pPN];
+			handlePHINode(M, pPN, pF, jte, context);
+		}
+	}
+
+	for (auto x: replace_map) {
+		Function *pF = x.first;
+		for (auto pI: *(x.second)) {
+      auto jte = jte_map[pI];
+      auto context = context_map[pI];
+			replaceUser(M, pI, pF, jte, context);
+		}
+	}
+}
+
+void FuncAddrSignPass::replaceUser(Module &M, Instruction *pI, Value *pV, Value *jte, Value *context) {
+	IRBuilder<> Builder(pI);
+	auto callA = insertTagi(M, &Builder, jte, context);
+	auto castA = Builder.CreateCast(Instruction::BitCast, callA, pV->getType());
+	replaceOp(pV, castA, pI);
+}
+
+Value *FuncAddrSignPass::insertTagi(Module &M, IRBuilder<> *Builder, Value *jte, Value *context) {
+	if (PA || ACFI) {
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C)}, false);
+		auto castA = Builder->CreateCast(Instruction::BitCast, jte, Type::getInt8PtrTy(*C));
+		auto tagi = QEMU? M.getOrInsertFunction("__tagi", FuncTypeA) :
+											Intrinsic::getDeclaration(&M, Intrinsic::acfi_tagi, {Type::getInt8PtrTy(*C)});
+
+		return Builder->CreateCall(tagi, {castA, context}, "");
+	} else {
+		return Builder->CreateCast(Instruction::BitCast, jte, Type::getInt8PtrTy(*C));
+	}
+}
+
+Value *FuncAddrSignPass::insertTagd(Module &M, IRBuilder<> *Builder, Value *jte, Value *context) {
+	if (PA || ACFI) {
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C)}, false);
+		auto tagd = QEMU? M.getOrInsertFunction("__tagd", FuncTypeA) :
+											Intrinsic::getDeclaration(&M, Intrinsic::acfi_tagd, {Type::getInt8PtrTy(*C)});
+
+		return Builder->CreateCall(tagd, {jte, context}, "");
+	} else {
+		return Builder->CreateCast(Instruction::BitCast, jte, Type::getInt8PtrTy(*C));
+	}
+}
+
+Value *FuncAddrSignPass::insertAuti(Module &M, IRBuilder<> *Builder, Value *pV, Value *context) {
+	if (PA || ACFI) {
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+		Value *num = ConstantInt::get(Type::getInt64Ty(*C), temp_cnt++);
+
+		if (QEMU) {
+			auto autia = M.getOrInsertFunction("__auti", FuncTypeA);
+			return Builder->CreateCall(autia, {pV, context, num}, "");
+		} else {
+			auto autia = Intrinsic::getDeclaration(&M, Intrinsic::acfi_auti, {Type::getInt8PtrTy(*C)});
+			return Builder->CreateCall(autia, {pV, context}, "");
+		}
+	} else {
+		return Builder->CreateCast(Instruction::BitCast, pV, Type::getInt8PtrTy(*C));
+	}
+}
+
+Value *FuncAddrSignPass::insertXtag(Module &M, IRBuilder<> *Builder, Value *pV) {
+	if (PA || ACFI) {
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C)}, false);
+
+		if (pV->getType()->isPointerTy()) {
+			auto castA = Builder->CreateCast(Instruction::BitCast, pV, Type::getInt8PtrTy(*C));
+			auto xtag = QEMU? M.getOrInsertFunction("__xtag", FuncTypeA) :
+												Intrinsic::getDeclaration(&M, Intrinsic::acfi_xtag, {Type::getInt8PtrTy(*C)});
+			auto callA = Builder->CreateCall(xtag, {castA}, "");
+			return callA;
+		} else {
+			auto castA = Builder->CreateIntToPtr(pV, Type::getInt8PtrTy(*C));
+			auto xtag = QEMU? M.getOrInsertFunction("__xtag", FuncTypeA) :
+												Intrinsic::getDeclaration(&M, Intrinsic::acfi_xtag, {Type::getInt8PtrTy(*C)});
+			auto callA = Builder->CreateCall(xtag, {castA}, "");
+			return callA;
+		}
+	} else {
+		return Builder->CreateCast(Instruction::BitCast, pV, Type::getInt8PtrTy(*C));
+	}
+}
+
+void FuncAddrSignPass::insertBsetm(Module &M, IRBuilder<> *Builder, Value *pV) {
+	FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), {Type::getInt8PtrTy(*C)}, false);
+	auto bsetm = QEMU? M.getOrInsertFunction("__bsetm", FuncTypeA) :
+										Intrinsic::getDeclaration(&M, Intrinsic::acfi_bsetm);
+	Builder->CreateCall(bsetm, {pV}, "");
+}
+
+
+Value *FuncAddrSignPass::insertClosure(Module &M, IRBuilder<> *Builder, Value *ptr_op, Value *val_op, Value *context) {
+	if (ACFI) {
+		auto castA = Builder->CreateCast(Instruction::BitCast, ptr_op, Type::getInt8PtrTy(*C));
+		auto castB = Builder->CreateCast(Instruction::BitCast, val_op, Type::getInt8PtrTy(*C));
+		auto castC = Builder->CreatePtrToInt(ptr_op, Type::getInt64Ty(*C));
+		insertBsetm(M, Builder, castA);
+		auto callA = insertTagi(M, Builder, castB, castC);
+		auto castD = Builder->CreateCast(Instruction::BitCast, callA, val_op->getType());
+		return castD;
+	} else {
+		return val_op;
+	}
+}
+
+void FuncAddrSignPass::replaceOp(Value *pVa, Value *pVb, Instruction *pI) {
+	//errs() << "pVa->dump(): "; pVa->dump();
+	//errs() << "pVb->dump(): "; pVb->dump();
+	//errs() << "pI->dump(): "; pI->dump();
+	unsigned nth = 0;
+	bool chk = false;
+	for (auto op = pI->op_begin(); op != pI->op_end(); op++) {
+		if (auto *_pVa = dyn_cast<Value>(op)) {
+			if (_pVa == pVa) {
+				pI->setOperand(nth, pVb);
+				//errs() << "(2) pI->dump(): "; pI->dump();
+				chk = true;
+				//break;
+			}
+		}
+
+		nth++;
+	}
+
+	//errs() << "(3) pI->dump(): "; pI->dump();
+	ASSERT(chk);
+}
+
+void FuncAddrSignPass::handleBitCastOperator(Module &M, BitCastOperator *pBC, Value *jte, Value *context) {
+	map<Value*,set<Instruction*>*> replace_map;
+	set<PHINode*> phinode_set;
+
+	if (!replace_map[pBC])
+		replace_map[pBC] = new set<Instruction*>;
+
+	for (auto pU: pBC->users()) {
+		//errs() << "pU->dump(): "; pU->dump();
+		if (auto pI = dyn_cast<Instruction>(pU)) {
+			if (auto pSI = dyn_cast<StoreInst>(pI)) {
+				if (pSI->getValueOperand() == pBC) {
+					replace_map[pBC]->insert(pI);
+					//replaceUser(M, pSI, pF);
+				}
+			} else if (auto pCI = dyn_cast<CallInst>(pI)) {
+				if (pCI->getCalledFunction() != dyn_cast<Function>(pBC)) {
+					replace_map[pBC]->insert(pI);
+					//replaceUser(M, pI, pBC);
+				}
+			} else if (auto pII = dyn_cast<InvokeInst>(pI)) {
+				if (pII->getCalledFunction() != dyn_cast<Function>(pBC)) {
+					replace_map[pBC]->insert(pI);
+					//replaceUser(M, pI, pBC);
+				}
+			} else if (auto pSI = dyn_cast<SelectInst>(pI)) {
+				//errs() << "Found SelectInst: "; pI->dump();
+				replace_map[pBC]->insert(pI);
+			} else if (auto pPN = dyn_cast<PHINode>(pI)) {
+				phinode_set.insert(pPN);
+			} else {
+				errs() << "(4) pI->dump(): "; pI->dump();
+			}
+		} else if (auto pGV = dyn_cast<GlobalVariable>(pU)) {
+			//errs() << "Found GV! "; pGV->dump();
+			//handleGlobalFuncPtr(M, pGV, pBC);
+		} else if (auto pPTI = dyn_cast<PtrToIntOperator>(pU)) {
+			errs() << "(b) Found PtrToIntOperator! "; pPTI->dump();
+			//TODO
+		} else if (auto pConst = dyn_cast<Constant>(pU)) {
+			//handleConstant(M, pConst, pBC);
+		} else {
+			errs() << "(a) pU->dump(): "; pU->dump();
+		}
+	}
+
+	for (auto x: replace_map) {
+		Value *pV = x.first;
+		for (auto pI: *(x.second)) {
+			replaceUser(M, pI, pV, jte, context);
+		}
+	}
+
+	for (auto pPN: phinode_set) {
+		handlePHINode(M, pPN, pBC, jte, context);
+	}
+}
+
+void FuncAddrSignPass::handlePtrToIntOperator(Module &M, PtrToIntOperator *pPTI, Value *jte, Value *context) {
+	set<Instruction*> inst_set;
+	set<PHINode*> phinode_set;
+	map<Constant*, set<Instruction*>*> const_map;
+
+	for (auto pU: pPTI->users()) {
+		if (auto pI = dyn_cast<Instruction>(pU)) {
+			if (auto pSI = dyn_cast<StoreInst>(pI)) {
+				if (pSI->getValueOperand() == pPTI) {
+					inst_set.insert(pI);
+				}
+			} else if (auto pBC = dyn_cast<BitCastInst>(pI)) {
+				ASSERT(false); // 
+			} else if (auto pSI = dyn_cast<SelectInst>(pI)) {
+				inst_set.insert(pI);
+			} else if (auto pCI = dyn_cast<ICmpInst>(pI)) {
+				// Do nothing
+			} else if (auto pPN = dyn_cast<PHINode>(pI)) {
+				//errs() << "Found PHINode user of pPTI\n";
+				phinode_set.insert(pPN);
+			} else {
+				//TODO
+				errs() << "else pI->dump(): "; pI->dump();
+			}
+		} else if (auto pConst = dyn_cast<Constant>(pU)) {
+			if (!const_map[pConst])
+				const_map[pConst] = new set<Instruction*>;
+
+			//errs() << "pConst->dump(): "; pConst->dump();
+			if (pConst->getType()->isArrayTy() || pConst->getType()->isStructTy()) {
+				//errs() << "(2) pConst->dump(): "; pConst->dump();
+				for (auto pU2: pConst->users()) {
+					if (auto pI2 = dyn_cast<Instruction>(pU2)) {
+						const_map[pConst]->insert(pI2);
+						//errs() << "pI2->dump(): "; pI2->dump();
+					}
+				}
+			} else {
+			}
+		}
+	}
+
+	for (auto pI: inst_set) {
+		IRBuilder<> Builder(pI);
+		auto callA = insertTagi(M, &Builder, jte, context);
+		auto castB = Builder.CreatePtrToInt(callA, pPTI->getType());
+		replaceOp(pPTI, castB, pI);
+	}
+
+	for (auto pPN: phinode_set) {
+		handlePHINode(M, pPN, pPTI, jte, context);
+	}
+
+	for (auto x: const_map) {
+		Constant *pConst = x.first;
+		for (auto pI: *(x.second)) {
+			// TODO is first arg or second?
+			IRBuilder<> Builder(pI);
+			auto callA = insertTagi(M, &Builder, jte, context);
+			auto castB = Builder.CreatePtrToInt(callA, pPTI->getType());
+			auto undef = UndefValue::get(pConst->getType());
+			auto extract = Builder.CreateExtractValue(pConst, 1);
+			auto insert = Builder.CreateInsertValue(undef, castB, 0);
+			auto insert2 = Builder.CreateInsertValue(insert, extract, 1);
+
+			replaceOp(pConst, insert2, pI);
+		}
+	}
+}
+
+void FuncAddrSignPass::handlePHINode(Module &M, PHINode *pPN, Value *pV, Value *jte, Value *context) {
+	unsigned num = pPN->getNumIncomingValues();
+
+	for (unsigned i=0; i<num; i++) {
+		if (pPN->getIncomingValue(i) == pV) {
+			auto pBB = pPN->getIncomingBlock(i);
+			auto &I = pBB->back();
+
+			IRBuilder<> Builder(&I);
+			auto callA = insertTagi(M, &Builder, jte, context);
+
+      Value *castA = nullptr;
+      if (pV->getType()->isPointerTy())
+        castA = Builder.CreateCast(Instruction::BitCast, callA, pV->getType());
+      else
+        castA = Builder.CreatePtrToInt(callA, pV->getType());
+        
+      // To handle the case where pPN has same incoming blocks with same incoming value...
+      for (unsigned j=i; j<num; j++) {
+        if (pPN->getIncomingValue(j) == pV &&
+            pPN->getIncomingBlock(i) == pPN->getIncomingBlock(j)) {
+          pPN->setIncomingValue(j, castA);
+        }
+      }
+		}
+	}
+}
+
+void FuncAddrSignPass::handleGlobalVariables(Module &M) {
+	set<GlobalVariable*> gv_set;
+
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+
+		//errs() << "(a) pGV->dump(): "; pGV->dump();
+		if (pGV->getName().find(".str") != 0 && pGV->hasInitializer()) {
+			gv_set.insert(pGV);
+		}
+  }
+
+	for (auto pGV: gv_set) {
+		//errs() << "pGV->dump(): "; pGV->dump();
+		handleGlobalVariable(M, pGV);
+	}
+}
+
+void FuncAddrSignPass::handleGlobalVariable(Module &M, GlobalVariable *pGV) {
+	Constant *pConst = pGV->getInitializer();
+	Type *ty = pConst->getType();
+
+	vector<Value*> *indices = new vector<Value*>;
+
+	if (Function *pF = dyn_cast<Function>(pConst)) {
+		if (white_set.find(pF) != white_set.end())
+			handleFunctionTy(M, pF, pGV, indices, pF);
+	} else if (auto *pBC = dyn_cast<BitCastOperator>(pConst)) {
+		//errs() << "(1) BitCastOp pConst->dump(): "; pConst->dump();
+		if (Function *pF = dyn_cast<Function>(pBC->getOperand(0))) {
+			if (white_set.find(pF) != white_set.end())
+				handleFunctionTy(M, pBC, pGV, indices, pF);
+			//errs() << "(1) BitCastOp with Function Pointer pConst->dump(): "; pConst->dump();
+		}
+	} else if (ty->isArrayTy()) {
+		indices->push_back(ConstantInt::get(Type::getInt64Ty(*C), 0));
+		handleArrayTy(M, pConst, pGV, indices);
+	} else if (ty->isStructTy()) {
+		indices->push_back(ConstantInt::get(Type::getInt32Ty(*C), 0));
+		handleStructTy(M, pConst, pGV, indices);
+	} else if (ty->isPointerTy()) {
+		//errs() << "(1) Pointer ty->dump(): "; ty->dump();
+	} else {
+		//errs() << "(1) else ty->dump(): "; ty->dump();
+	}
+
+	pGV->setConstant(false);
+
+	delete indices;
+}
+
+void FuncAddrSignPass::handleFunctionTy(Module &M, Value *pV, GlobalVariable *pGV, vector<Value*> *indices, Function *pF) {
+	//errs() << "Handle Function: " << pF->getName() << "\n";
+	auto &BB = entry->front();
+	auto &I = BB.back();
+	IRBuilder<> Builder(&I);
+
+	//errs() << "pGV->dump(): "; pGV->dump();
+	//for (auto x: *indices) {
+	//	x->dump();
+	//}
+
+	unsigned num_param = pF->getFunctionType()->getNumParams();
+	Function *jt = jt_map[num_param];
+
+	unsigned offset = 0;
+	auto context = ConstantInt::get(Type::getInt64Ty(*C), num_param);
+	auto zero = ConstantInt::get(Type::getInt64Ty(*C), 0);
+
+	bool found = false;
+	for (auto _pF: *fl_map[num_param]) {
+		if (_pF == pF) {
+			found = true;
+			break;
+		}
+		offset++;
+	}
+
+	ASSERT(found);
+
+	Value *jte = nullptr;
+	if (PA) {
+		jte = ConstantExpr::getBitCast(pF, Type::getInt64Ty(*C));
+	} else {
+		auto castA = ConstantExpr::getPtrToInt(jt, Type::getInt64Ty(*C));
+		auto offsetA = ConstantInt::get(Type::getInt64Ty(*C), offset*16);
+		auto addA = ConstantExpr::getAdd(castA, offsetA);
+		jte = ConstantExpr::getIntToPtr(addA, Type::getInt8PtrTy(*C));
+	}
+
+  auto callA = insertTagi(M, &Builder, jte, context);
+	if (visit_set.find(pF) == visit_set.end()) {
+		visit_set.insert(pF);
+	}
+
+  // For store val_op, ptr_op, do...
+  // pacia jte, (pacda ptr_op, 0)
+  // store jte, ptr_op
+	auto ety = dyn_cast<PointerType>(pGV->getType())->getElementType();
+	auto gepB = Builder.CreateGEP(ety, pGV, *indices);
+  // 1.
+	auto callB = insertClosure(M, &Builder, gepB, callA, context);
+	auto castB = Builder.CreateCast(Instruction::BitCast, callB, pV->getType());
+	auto store = Builder.CreateStore(castB, gepB);
+	store->setAlignment(Align(8));
+}
+
+void FuncAddrSignPass::handleArrayTy(Module &M, Constant *pConst, GlobalVariable *pGV, vector<Value*> *indices) {
+	Type *ty = pConst->getType();
+	unsigned n = ty->getArrayNumElements();
+	Type *_ty = ty->getArrayElementType();
+	//errs() << "pConst->dump(): "; pConst->dump();
+	//errs() << "Handle Array Ty(" << n << "): "; ty->dump();
+
+	for (unsigned i=0; i<n; i++) {
+		Constant *_pConst = pConst->getAggregateElement(i);
+		vector<Value*> *indices_new = new vector<Value*>;
+		//errs() << "Array[" << i << "] Aggregate Element\n";
+		//errs() << "_pConst->dump(): "; _pConst->dump();
+
+		// Copy indices
+		for (auto pV: *indices)
+			indices_new->push_back(pV);
+
+		indices_new->push_back(ConstantInt::get(Type::getInt64Ty(*C), i));
+
+		// Check element type
+		if (auto *_pF = dyn_cast<Function>(_pConst)) {
+			if (white_set.find(_pF) != white_set.end())
+				handleFunctionTy(M, _pF, pGV, indices_new, _pF);
+		} else if (auto *_pGA = dyn_cast<GlobalAlias>(_pConst)) {
+			if (auto *_pF = dyn_cast<Function>(_pGA->getAliasee())) {
+				if (white_set.find(_pF) != white_set.end())
+					handleFunctionTy(M, _pGA, pGV, indices_new, _pF);
+				//errs() << "(1) Found!!!\n";
+			}
+		} else if (auto *_pBC = dyn_cast<BitCastOperator>(_pConst)) {
+			if (auto *_pF = dyn_cast<Function>(_pBC->getOperand(0))) {
+				if (white_set.find(_pF) != white_set.end())
+					handleFunctionTy(M, _pBC, pGV, indices_new, _pF);
+			} else if (auto *_pGA = dyn_cast<GlobalAlias>(_pBC->getOperand(0))) {
+				if (auto *_pF = dyn_cast<Function>(_pGA->getAliasee())) {
+					if (white_set.find(_pF) != white_set.end())
+						handleFunctionTy(M, _pBC, pGV, indices_new, _pF);
+					//errs() << "(2) Found!!!\n";
+				}
+			}
+		} else if (_ty->isArrayTy()) {
+			handleArrayTy(M, _pConst, pGV, indices_new);
+		} else if (_ty->isStructTy()) {
+			handleStructTy(M, _pConst, pGV, indices_new);
+		} else {
+			//errs() << "(1) else _ty->dump(): "; _ty->dump();
+		}
+
+		delete indices_new;
+	}
+}
+
+void FuncAddrSignPass::handleStructTy(Module &M, Constant *pConst, GlobalVariable *pGV, vector<Value*> *indices) {
+	Type *ty = pConst->getType();
+	unsigned n = dyn_cast<StructType>(ty)->getNumElements();
+	//errs() << "pConst->dump(): "; pConst->dump();
+	//errs() << "Handle Struct Ty(n:" << n << "): "; ty->dump();
+
+	for (unsigned i=0; i<n; i++) {
+		Constant *_pConst = pConst->getAggregateElement(i);
+		Type *_ty = dyn_cast<StructType>(ty)->getElementType(i);
+		vector<Value*> *indices_new = new vector<Value*>;
+		//errs() << "Struct[" << i << "] Aggregate Element\n";
+		//errs() << "_pConst->dump(): "; _pConst->dump();
+		//errs() << "_ty->dump(): "; _ty->dump();
+
+		// Copy indices
+		for (auto pV: *indices)
+			indices_new->push_back(pV);
+
+		indices_new->push_back(ConstantInt::get(Type::getInt32Ty(*C), i));
+
+		// Check element type
+		if (Function *_pF = dyn_cast<Function>(_pConst)) {
+			if (white_set.find(_pF) != white_set.end())
+				handleFunctionTy(M, _pF, pGV, indices_new, _pF);
+		} else if (auto *_pGA = dyn_cast<GlobalAlias>(_pConst)) {
+			if (auto *_pF = dyn_cast<Function>(_pGA->getAliasee())) {
+				if (white_set.find(_pF) != white_set.end())
+					handleFunctionTy(M, _pGA, pGV, indices_new, _pF);
+				errs() << "(3) Found!!!\n";
+			}
+		} else if (auto *_pBC = dyn_cast<BitCastOperator>(_pConst)) {
+			if (Function *_pF = dyn_cast<Function>(_pBC->getOperand(0))) {
+				if (white_set.find(_pF) != white_set.end())
+					handleFunctionTy(M, _pBC, pGV, indices_new, _pF);
+			} else if (auto *_pGA = dyn_cast<GlobalAlias>(_pBC->getOperand(0))) {
+				if (auto *_pF = dyn_cast<Function>(_pGA->getAliasee())) {
+					if (white_set.find(_pF) != white_set.end())
+						handleFunctionTy(M, _pBC, pGV, indices_new, _pF);
+					errs() << "(4) Found!!!\n";
+				}
+			}
+		} else if (_ty->isArrayTy()) {
+			handleArrayTy(M, _pConst, pGV, indices_new);
+		} else if (_ty->isStructTy()) {
+			handleStructTy(M, _pConst, pGV, indices_new);
+		//} else if (_ty->isPointerTy()) {
+		} else {
+			//errs() << "(2) else _ty->dump(): "; _ty->dump();
+		}
+
+		delete indices_new;
+	}
+}
+
+void FuncAddrSignPass::handleIndirectCalls(Module &M) {
+	set<Instruction*> call_set;
+
+	for (auto &F: M) {
+    // Skip startup code
+		if (F.getSection().find(".text.startup") != std::string::npos)
+      continue;
+
+		for (auto &BB : F) {
+			Function *caller = &F;
+
+			for (auto &I : BB) {
+				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+					if (!pCI->isIndirectCall())
+						continue;
+
+			  } else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I)) {
+					if (!pII->isIndirectCall())
+						continue;
+
+          //if (auto pty = PointerType::get(StructType::getTypeByName(*C, "class.std::ctype"), 0)) {
+          //  FunctionType *FuncTypeA = FunctionType::get(Type::getInt8Ty(*C), {pty, Type::getInt8Ty(*C)}, false);
+          //  if (pII->getFunctionType() == FuncTypeA) {
+          //    errs() << "Found function type to ignore!\n";
+          //    continue;
+          //  }
+          //}
+				} else {
+          continue;
+				}
+
+				call_set.insert(&I);
+				statNumIndirectCall++;
+			}
+		}
+	}
+
+	for (auto pI: call_set) {
+		// Insert echk before pCI
+		handleIndirectCall(M, pI);
+	}
+}
+
+void FuncAddrSignPass::handleIndirectCall(Module &M, Instruction *pI) {
+  //errs() << "pI->dump(): "; pI->dump();
+	Value* callee = NULL;
+	FunctionType *fty0 = NULL;
+
+	if (CallInst *pCI = dyn_cast<CallInst>(pI)) {
+		callee = pCI->getCalledOperand();
+		fty0 = pCI->getFunctionType();
+	} else if (InvokeInst *pII = dyn_cast<InvokeInst>(pI)) {
+		callee = pII->getCalledOperand();
+		fty0 = pII->getFunctionType();
+	}
+
+	unsigned num_param = fty0->getNumParams();
+	auto context = ConstantInt::get(Type::getInt64Ty(*C), num_param);
+	Function *jt = jt_map[num_param];
+
+  if (!jt) {
+    // Create a fake jumptable
+		if (!fl_map[num_param])
+			fl_map[num_param] = new list<Function*>;
+
+    errs() << "Jumptable is not found!\n";
+    FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), false);
+    jt = Function::Create(FuncTypeA, Function::ExternalLinkage, "__cfi_jumptable", M);
+    auto pBB = BasicBlock::Create(*C, "", jt, nullptr);
+    new UnreachableInst(*C, pBB);
+    jt->setAlignment(Align(8));
+
+    jt_map[num_param] = jt;
+
+    auto &BB = jt->back();
+    auto &I = BB.back();
+    IRBuilder<> Builder(&I);
+    for (unsigned i=0; i<8; i++) {
+      FunctionType *FuncTypeB = FunctionType::get(Type::getVoidTy(*C), {}, false);
+      InlineAsm *trap = InlineAsm::get(FuncTypeB, "ebreak", "", /*hasSideEffects=*/ true);
+      Builder.CreateCall(trap);
+    }
+  }
+
+	unsigned mask = fl_map[num_param]->size() * 16;
+	//errs() << "(1) mask: " << mask << "\n";
+	mask = getNextPow2(mask);
+	//errs() << "(2) mask: " << mask << "\n";
+	mask--;
+	//errs() << "(3) mask: " << mask << "\n";
+	mask &= ~0xF;
+	//errs() << "(4) mask: " << mask << "\n";
+
+	// jte = autia callee, context;
+	// jte = jt + (jte & mask);
+	// jte = jt + (callee - jt) & mask;
+	IRBuilder<> Builder(pI);
+
+	if (PA) {
+		auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+		auto callA = insertAuti(M, &Builder, castA, context);
+		auto castB = Builder.CreateCast(Instruction::BitCast, callA, callee->getType());
+		replaceOp(callee, castB, pI);
+	} else if (IFCC) {
+	  if (LARGE_ALIGN) {
+			auto addr = Builder.CreatePtrToInt(callee, Type::getInt64Ty(*C));
+			auto cnst = ConstantInt::get(Type::getInt64Ty(*C), mask);
+			auto offset = Builder.CreateAnd(addr, cnst);
+			auto base = Builder.CreatePtrToInt(jt, Type::getInt64Ty(*C));
+			auto res = Builder.CreateAdd(base, offset);
+			auto jte = Builder.CreateIntToPtr(res, callee->getType());
+			replaceOp(callee, jte, pI);
+		} else {
+			auto op1 = Builder.CreatePtrToInt(callee, Type::getInt64Ty(*C));
+			auto op2 = Builder.CreatePtrToInt(jt, Type::getInt64Ty(*C));
+			auto res1 = Builder.CreateSub(op1, op2);
+			auto cnst = ConstantInt::get(Type::getInt64Ty(*C), mask);
+			auto offset = Builder.CreateAnd(res1, cnst);
+			auto res2 = Builder.CreateAdd(op2, offset);
+			auto jte = Builder.CreateIntToPtr(res2, callee->getType());
+			replaceOp(callee, jte, pI);
+		}
+	} else if (ACFI) {
+		if (LARGE_ALIGN) {
+			auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+			auto callA = insertAuti(M, &Builder, castA, context);
+			auto addr = Builder.CreatePtrToInt(callA, Type::getInt64Ty(*C));
+			auto cnst = ConstantInt::get(Type::getInt64Ty(*C), mask);
+			auto offset = Builder.CreateAnd(addr, cnst);
+			auto base = Builder.CreatePtrToInt(jt, Type::getInt64Ty(*C));
+			auto res = Builder.CreateAdd(base, offset);
+			auto jte = Builder.CreateIntToPtr(res, callee->getType());
+			replaceOp(callee, jte, pI);
+		} else {
+			auto castA = Builder.CreateCast(Instruction::BitCast, callee, Type::getInt8PtrTy(*C));
+			auto callA = insertAuti(M, &Builder, castA, context);
+			auto op1 = Builder.CreatePtrToInt(callA, Type::getInt64Ty(*C));
+			auto op2 = Builder.CreatePtrToInt(jt, Type::getInt64Ty(*C));
+			auto res1 = Builder.CreateSub(op1, op2);
+			auto cnst = ConstantInt::get(Type::getInt64Ty(*C), mask);
+			auto offset = Builder.CreateAnd(res1, cnst);
+			auto res2 = Builder.CreateAdd(op2, offset);
+			auto jte = Builder.CreateIntToPtr(res2, callee->getType());
+			replaceOp(callee, jte, pI);
+		}
+
+		// This is for debugging
+		//FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C)}, false);
+		//Value *num = ConstantInt::get(Type::getInt64Ty(*C), temp_cnt++);
+		//auto print = M.getOrInsertFunction("__print_value", FuncTypeA);
+
+		//Builder.CreateCall(print, {castA, num}); //
+		//Builder.CreateCall(print, {callA, num}); //
+		//auto castB = Builder.CreateCast(Instruction::BitCast, jt, Type::getInt8PtrTy(*C));
+		//Builder.CreateCall(print, {castB, num}); //
+		//auto castC = Builder.CreateCast(Instruction::BitCast, jte, Type::getInt8PtrTy(*C));
+		//Builder.CreateCall(print, {castC, num}); //
+	}
+}
+
+void FuncAddrSignPass::handleIntrinsicFunctions(Module &M) {
+	for (auto &F: M) {
+    for (auto &BB: F) {
+      for (auto &I: BB) {
+				Function *pF = nullptr;
+
+        if (CallInst *pCI = dyn_cast<CallInst>(&I))
+          pF = pCI->getCalledFunction();
+        else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I))
+          pF = pII->getCalledFunction();
+
+				if (pF && pF->isDeclaration()) {
+					if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+						unsigned n = pCI->getNumOperands();
+
+						for (unsigned i=0; i<n-1; i++) {
+							Value *pV = pCI->getOperand(i);
+							Type *ty = pV->getType();
+
+							if (auto pty = dyn_cast<PointerType>(ty)) {
+								if (pty->getElementType()->isFunctionTy()) {
+									IRBuilder<> Builder(&I);		
+									auto callA = insertXtag(M, &Builder, pV);
+									auto castA = Builder.CreateCast(Instruction::BitCast, callA, pV->getType());
+									pCI->setOperand(i, castA);
+								}
+							}
+						}
+					} else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I)) {
+						unsigned n = pII->getNumOperands();
+
+						for (unsigned i=0; i<n-1; i++) {
+							Value *pV = pII->getOperand(i);
+							Type *ty = pV->getType();
+
+							if (auto pty = dyn_cast<PointerType>(ty)) {
+								if (pty->getElementType()->isFunctionTy()) {
+									IRBuilder<> Builder(&I);		
+									auto callA = insertXtag(M, &Builder, pV);
+									auto castA = Builder.CreateCast(Instruction::BitCast, callA, pV->getType());
+									pII->setOperand(i, castA);
+								}
+							}
+						}
+					}
+        }
+      }
+    }
+  }
+}
+
+void FuncAddrSignPass::init(Module &M) {
+	Function *start = nullptr;
+
+	for (auto &F : M) {
+		if (&F && F.getSection().find(".text.startup") != std::string::npos) {
+			start = &F;
+			break;
+		}
+	}
+
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+		  C = &F.getContext();
+			DL = &F.getParent()->getDataLayout();
+			main = &F;
+			if (!start)
+				start = main;
+			break;
+		}
+	}
+
+	FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), false);
+	entry = Function::Create(FuncTypeA, Function::ExternalLinkage, "__init_acfi", M);
+	auto pBB = BasicBlock::Create(*C, "", entry, nullptr);
+	ReturnInst::Create(*C, pBB);
+
+	auto &BB = start->front();
+	auto &I = BB.front();
+	IRBuilder<> Builder(&I);		
+	Builder.CreateCall(FuncTypeA, entry);
+}
+
+//void FuncAddrSignPass::buildTypeString(const Type *T, llvm::raw_string_ostream &O) {
+//  if (T->isPointerTy()) {
+//    O << "ptr.";
+//    buildTypeString(T->getPointerElementType(), O);
+//  } else if (T->isStructTy()) {
+//		auto sty = dyn_cast<StructType>(T);
+//		std::regex e("^(\\w+\\.\\w+)(\\.\\w+)?$");
+//
+//		if (sty->isLiteral()) {
+//			O << std::regex_replace("str.", e, "$1");
+//		} else {
+//			auto structName = dyn_cast<StructType>(T)->getStructName();
+//			O << std::regex_replace(structName.str(), e, "$1");
+//		}
+//  } else if (T->isArrayTy()) {
+//    O << "arr.";
+//    buildTypeString(T->getArrayElementType(), O);
+//  } else if (T->isFunctionTy()) {
+//    auto FuncTy = dyn_cast<FunctionType>(T);
+//    O << "f.";
+//    buildTypeString(FuncTy->getReturnType(), O);
+//
+//    for (auto p = FuncTy->param_begin(); p != FuncTy->param_end(); p++) {
+//      buildTypeString(*p, O);
+//    }
+//  } else if (T->isVectorTy()) {
+//    O << "vec." << dyn_cast<VectorType>(T)->getElementCount();
+//    buildTypeString(dyn_cast<VectorType>(T)->getElementType(), O);
+//  } else if (T->isVoidTy()) {
+//    O << "v";
+//  } else {
+//    /* Make sure we've handled all cases we want to */
+//    assert(T->isIntegerTy() || T->isFloatingPointTy());
+//    T->print(O);
+//  }
+//}
+//
+//uint64_t FuncAddrSignPass::getTypeIDFor(const Type *T) {
+//  if (!T->isPointerTy())
+//    return 0; // Not a pointer, hence no type ID for this one
+//
+//  // TODO: This should perform caching, so calling the same Type will not
+//  // reprocess the stuff. Use a Dictionary-like ADT is suggested.
+//  decltype(TypeIDCache)::iterator id;
+//  if ((id = TypeIDCache.find(T)) != TypeIDCache.end())
+//    return id->second;
+//
+//  uint64_t theTypeID = 0;
+//  std::string buf;
+//  llvm::raw_string_ostream typeIdStr(buf);
+//
+//  buildTypeString(T, typeIdStr);
+//  typeIdStr.flush();
+//
+//  // Prepare SHA3 generation
+//  auto rawBuf = buf.c_str();
+//  mbedtls_sha3_context sha3_context;
+//  mbedtls_sha3_type_t sha3_type = MBEDTLS_SHA3_256;
+//  mbedtls_sha3_init(&sha3_context);
+//
+//  // Prepare input and output variables
+//  auto *input = reinterpret_cast<const unsigned char *>(rawBuf);
+//  auto *output = new unsigned char[32]();
+//
+//  // Generate hash
+//  auto result = mbedtls_sha3(input, buf.length(), sha3_type, output);
+//  if (result != 0)
+//    llvm_unreachable("SHA3 hashing failed :(");
+//  memcpy(&theTypeID, output, sizeof(theTypeID));
+//  // TODO need to fix delete[] output;
+//
+//  TypeIDCache.emplace(T, theTypeID);
+//
+//  return theTypeID;
+//}
+//
+//Constant *FuncAddrSignPass::getTypeIDConstantFrom(const Type &T, LLVMContext &C) {
+//  return Constant::getIntegerValue(Type::getInt64Ty(C),
+//                                   APInt(64, getTypeIDFor(&T)));
+//}
+
+void FuncAddrSignPass::printFuncAddr(Module &M) {
+	auto &BB = entry->front();
+	auto &I = BB.front();
+	IRBuilder<> Builder(&I);
+
+	//for (auto &F : M) {
+	//	if (&F && !F.isDeclaration()) {
+	//		Constant *name = ConstantDataArray::getString(*C, F.getName(), true);
+
+	//		GlobalVariable* pGV = new GlobalVariable(M, 
+  //      /*Type=*/ name->getType(),
+  //      /*isConstant=*/ true,
+  //      /*Linkage=*/ GlobalValue::PrivateLinkage,
+  //      /*Initializer=*/ 0, // has initializer, specified below
+  //      /*Name=*/ ".func_name");
+	//		pGV->setAlignment(Align(1));
+	//		pGV->setInitializer(name);
+
+	//		auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+	//		auto castB = Builder.CreateCast(Instruction::BitCast, &F, Type::getInt8PtrTy(*C));
+	//		FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+	//		auto print = M.getOrInsertFunction("__print_func", FuncTypeA);
+	//		Builder.CreateCall(print, {castA, castB});
+	//	}
+	//}
+
+  for (auto x: jt_map) {
+		unsigned num_param = x.first;
+		Function *jt = x.second;
+
+		if (!jt)
+			continue;
+
+    Constant *name = ConstantDataArray::getString(*C, jt->getName(), true);
+
+    GlobalVariable* pGV = new GlobalVariable(M, 
+      /*Type=*/ name->getType(),
+      /*isConstant=*/ true,
+      /*Linkage=*/ GlobalValue::PrivateLinkage,
+      /*Initializer=*/ 0, // has initializer, specified below
+      /*Name=*/ ".func_name");
+    pGV->setAlignment(Align(1));
+    pGV->setInitializer(name);
+
+    auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+    auto castB = Builder.CreateCast(Instruction::BitCast, jt, Type::getInt8PtrTy(*C));
+    FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+    auto print = M.getOrInsertFunction("__print_func", FuncTypeA);
+    Builder.CreateCall(print, {castA, castB});
+
+		unsigned offset = 0;
+
+		for (auto pF: *fl_map[num_param]) {
+			// CreateGEP
+			//auto idx = ConstantInt::get(Type::getInt64Ty(*C), offset*4);
+			//auto cast = ConstantExpr::getBitCast(jt, PointerType::get(Type::getInt8PtrTy(*C), 0));
+			//auto gep = ConstantExpr::getGetElementPtr(Type::getInt8PtrTy(*C), cast, idx);
+			//auto jte = ConstantExpr::getBitCast(gep, Type::getInt8PtrTy(*C));
+      auto castA = ConstantExpr::getPtrToInt(jt, Type::getInt64Ty(*C));
+			auto offsetA = ConstantInt::get(Type::getInt64Ty(*C), offset*16);
+      auto addA = ConstantExpr::getAdd(castA, offsetA);
+      auto jte = ConstantExpr::getIntToPtr(addA, Type::getInt8PtrTy(*C));
+			offset++;
+
+      Constant *name = ConstantDataArray::getString(*C, pF->getName(), true);
+
+      GlobalVariable* pGV = new GlobalVariable(M, 
+        /*Type=*/ name->getType(),
+        /*isConstant=*/ true,
+        /*Linkage=*/ GlobalValue::PrivateLinkage,
+        /*Initializer=*/ 0, // has initializer, specified below
+        /*Name=*/ ".func_name");
+      pGV->setAlignment(Align(1));
+      pGV->setInitializer(name);
+
+    {
+      auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+      auto castB = Builder.CreateCast(Instruction::BitCast, pF, Type::getInt8PtrTy(*C));
+      FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+      auto print = M.getOrInsertFunction("__print_func", FuncTypeA);
+      Builder.CreateCall(print, {castA, castB});
+    }
+    {
+      auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+      auto castB = Builder.CreateCast(Instruction::BitCast, jte, Type::getInt8PtrTy(*C));
+      FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C)}, false);
+      auto print = M.getOrInsertFunction("__print_func", FuncTypeA);
+      Builder.CreateCall(print, {castA, castB});
+    }
+    }
+  }
+}
+
+void FuncAddrSignPass::insertAcfiSet(Module &M, int enable) {
+  //for (auto &F : M) {
+  //  if (&F && !F.isDeclaration()) {
+  //    auto &BB = F.front();
+  //    auto &I = BB.front();
+  //    IRBuilder<> Builder(&I);
+
+  //    Value *arg = ConstantInt::get(Type::getInt64Ty(M.getContext()), func_num++);
+  //    FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt64Ty(M.getContext())}, false);
+  //    auto print = F.getParent()->getOrInsertFunction("dpt_print_func", FuncTypeA);
+  //    Builder.CreateCall(print, {arg});
+
+	//		for (auto &BB: F) {
+	//			for (auto &I: BB) {
+	//				if (dyn_cast<ReturnInst>(&I)) {
+	//					IRBuilder<> BuilderB(&I);
+
+	//					Value *arg = ConstantInt::get(Type::getInt64Ty(M.getContext()), func_num-1);
+	//					FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(M.getContext()), {Type::getInt64Ty(M.getContext())}, false);
+	//					auto print = F.getParent()->getOrInsertFunction("dpt_print_func_ret", FuncTypeA);
+	//					BuilderB.CreateCall(print, {arg});
+	//					break;
+	//				}
+	//			}
+	//		}
+
+  //  }
+  //}
+
+	// Insert acfi_set() to init configuration
+	auto &BB = entry->front();
+	auto &I = BB.front();
+	IRBuilder<> Builder(&I);
+	auto en = ConstantInt::get(Type::getInt64Ty(*C), enable);
+
+	FunctionType *FuncTypeA = FunctionType::get(Type::getVoidTy(*C), Type::getInt64Ty(*C), false);
+	auto init = M.getOrInsertFunction("__acfi_set", FuncTypeA);
+	Builder.CreateCall(init, en);
+}
+
+//	for (auto x: jt_map) {
+//		unsigned num_param = x.first;
+//		Function *jt = x.second;
+//
+//		if (!jt)
+//			continue;
+//
+//		unsigned offset = 0;
+//	  auto context = ConstantInt::get(Type::getInt64Ty(*C), num_param);
+//
+//		for (auto pF: *fl_map[num_param]) {
+//			// CreateGEP
+//			auto idx = ConstantInt::get(Type::getInt64Ty(*C), offset);
+//			auto cast = ConstantExpr::getBitCast(jt, PointerType::get(Type::getInt8PtrTy(*C), 0));
+//			auto gep = ConstantExpr::getGetElementPtr(Type::getInt8PtrTy(*C), cast, idx);
+//			auto jte = ConstantExpr::getBitCast(gep, Type::getInt8PtrTy(*C));
+//			offset++;
+//
+//			for (auto pU: pF->users()) {
+//				if (auto pI = dyn_cast<Instruction>(pU)) {
+//					if (auto pSI = dyn_cast<StoreInst>(pI)) {
+//						if (pSI->getValueOperand() == pF) {
+//							replaceUser(M, pI, pF, jte, context);
+//            }
+//					} else if (auto pCI = dyn_cast<CallInst>(pI)) {
+//						if (pCI->getCalledFunction() != pF)
+//							replaceUser(M, pI, pF, jte, context);
+//					} else if (auto pII = dyn_cast<InvokeInst>(pI)) {
+//						if (pII->getCalledFunction() != pF)
+//							replaceUser(M, pI, pF, jte, context);
+//					} else if (auto pBC = dyn_cast<BitCastInst>(pI)) {
+//						ASSERT(false); // 
+//					} else if (auto pSI = dyn_cast<SelectInst>(pI)) {
+//						replaceUser(M, pI, pF, jte, context);
+//					} else if (auto pCI = dyn_cast<ICmpInst>(pU)) {
+//						// Do nothing
+//					} else if (auto pPN = dyn_cast<PHINode>(pI)) {
+//						handlePHINode(M, pPN, pF, jte, context);
+//						//phinode_map[pF]->insert(pPN);
+//					} else {
+//						errs() << "else pI->dump(): "; pI->dump(); //TODO
+//					}
+//				} else if (auto pGV = dyn_cast<GlobalVariable>(pU)) {
+//					// will be handled separately
+//				} else if (auto pPTI = dyn_cast<PtrToIntOperator>(pU)) {
+//					handlePtrToIntOperator(M, pPTI, jte, context);
+//				} else if (auto pBC = dyn_cast<BitCastOperator>(pU)) {
+//					//errs() << "Found BC! "; pBC->dump();
+//					//bitcast_map[pF]->insert(pBC);
+//					handleBitCastOperator(M, pBC, jte, context);
+//					//handleBitCastOperator(M, pBC, pF);
+//				} else if (auto pConst = dyn_cast<Constant>(pU)) {
+//				} else {
+//					errs() << "pU->dump(): "; pU->dump();
+//				}
+//			}
+//		}
+//	}
