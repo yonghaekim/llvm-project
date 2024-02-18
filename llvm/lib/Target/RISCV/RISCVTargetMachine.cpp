@@ -285,18 +285,6 @@ void RISCVPassConfig::addIRPasses() {
   const auto dptInstType = DPT::getDptInstType();
 	if (dptInstType != DPT::None) {
 		addPass(DPT::createDataPtrTagPass());
-		addPass(DPT::createASanPass());
-	}
-
-  const auto acfiInstType = ACFI::getAcfiInstType();
-	if (acfiInstType != ACFI::None) {
-		//addPass(ACFI::createJumpTableGenPass());
-		//addPass(ACFI::createFuncAddrSignPass());
-		//addPass(ACFI::createShadowCallMemPass());
-		addPass(ACFI::createIFCCPass());
-		addPass(ACFI::createPAPass());
-		addPass(ACFI::createACFIPass());
-		addPass(ACFI::createMCPass());
 	}
 	//yh+end
 }
